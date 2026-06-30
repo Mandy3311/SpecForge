@@ -45,7 +45,7 @@ from typing import List, Optional, Tuple
 import torch
 import torch.distributed as dist
 from tqdm import tqdm
-from transformers import AutoConfig, AutoProcessor, AutoTokenizer
+from transformers import AutoConfig, AutoProcessor
 
 from datasets import Dataset
 from specforge.args import SGLangBackendArgs
@@ -59,6 +59,7 @@ from specforge.distributed import (
 )
 from specforge.modeling.target import Eagle3TargetModel, get_eagle3_target_model
 from specforge.utils import (
+    load_tokenizer,
     print_args_with_dots,
     print_with_rank,
     rank_0_priority,
@@ -613,21 +614,23 @@ def main():
     assert os.path.exists(
         args.data_path
     ), f"Dataset path {args.data_path} does not exist"
-    dataset = Dataset.from_generator(
-        generator=safe_conversations_generator,
-        gen_kwargs={"file_path": args.data_path},
-        cache_dir=os.path.join(
-            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-            "cache",
-            "hf_dataset",
-        ),
-    )
+
+    with rank_0_priority():
+        print_with_rank("Loading/building dataset cache...")
+        dataset = Dataset.from_generator(
+            generator=safe_conversations_generator,
+            gen_kwargs={"file_path": args.data_path},
+            cache_dir=os.path.join(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                "cache",
+                "hf_dataset",
+            ),
+            num_proc=min(args.build_dataset_num_proc, 32),
+        )
     if args.num_samples is not None:
         dataset = dataset.select(range(args.num_samples))
     # Tokenizer and cache key
-    tokenizer = AutoTokenizer.from_pretrained(
-        args.target_model_path, trust_remote_code=True
-    )
+    tokenizer = load_tokenizer(args.target_model_path, trust_remote_code=True)
     cache_params_string = f"{args.data_path}-{args.max_length}-{args.chat_template}-{args.target_model_path}-{args.num_samples}-{args.is_preformatted}"
     cache_key = hashlib.md5(cache_params_string.encode()).hexdigest()
 

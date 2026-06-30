@@ -22,6 +22,7 @@
 
 import gzip
 import io
+import json
 import os
 import re
 import warnings
@@ -122,6 +123,7 @@ def preprocess_conversations(
     max_length: int = 2048,
     is_preformatted: bool = False,
     train_only_last_turn: bool = False,
+    tools: Optional[List[List[Dict]]] = [[]],
     **kwargs,
 ) -> Dict[str, List[torch.Tensor]]:
     """
@@ -135,6 +137,7 @@ def preprocess_conversations(
         max_length: The maximum length of the tokenized input.
         is_preformatted: Whether the input is already formatted text strings.
         train_only_last_turn: If True, only the last assistant turn contributes to the loss.
+        tools: Optional list of tools information corresponding to each conversation, used for tool-use conversations.
 
     Returns:
         A dictionary containing:
@@ -142,10 +145,8 @@ def preprocess_conversations(
             - loss_mask: List of loss masks indicating which tokens should contribute to the loss.
             - attention_mask: List of attention masks.
     """
-
     # prepare result
     results = {"input_ids": [], "loss_mask": [], "attention_mask": []}
-
     if chat_template.parser_type == "general":
         parser = GeneralParser(tokenizer, chat_template)
     elif chat_template.parser_type == "thinking":
@@ -154,12 +155,11 @@ def preprocess_conversations(
         parser = HarmonyParser(tokenizer, chat_template)
     else:
         raise ValueError(f"Invalid parser type: {chat_template.parser_type}")
-
     kwargs_list = [{} for _ in range(len(conversations))]
     for key, value_list in kwargs.items():
         for i, value in enumerate(value_list):
             kwargs_list[i][key] = value
-    for source, kwargs_item in zip(conversations, kwargs_list):
+    for source, tool, kwargs_item in zip(conversations, tools, kwargs_list):
         if not source:
             # if the source is None, skip it
             continue
@@ -168,6 +168,7 @@ def preprocess_conversations(
             max_length,
             preformatted=is_preformatted,
             train_only_last_turn=train_only_last_turn,
+            tool=tool,
             **kwargs_item,
         )
         results["input_ids"].append(input_ids[None, :])
@@ -245,7 +246,7 @@ def preprocess_vlm_conversations(
             else:
                 messages.append({"role": role, "content": sentence["content"]})
 
-        conversation = processor.apply_chat_template(
+        conversation = processor.tokenizer.apply_chat_template(
             messages,
             tokenize=False,
             add_generation_prompt=False,
@@ -305,6 +306,7 @@ def build_eagle3_dataset(
     processor: Optional[ImageProcessingMixin] = None,
     is_preformatted: Optional[bool] = False,
     train_only_last_turn: Optional[bool] = False,
+    minimum_valid_tokens: Optional[int] = None,
 ) -> HFDataset:
     """
     build eagle3 dataset
@@ -332,10 +334,14 @@ def build_eagle3_dataset(
                         If False, expects "conversations" column with ShareGPT format.
         train_only_last_turn: If True, only the last assistant turn contributes to the loss.
                              Useful for thinking models where history may not contain thoughts.
+        minimum_valid_tokens: If set, drops samples with fewer trainable tokens.
 
     Returns:
         The processed HF dataset.
     """
+    if minimum_valid_tokens is not None and minimum_valid_tokens < 0:
+        raise ValueError("minimum_valid_tokens must be >= 0")
+
     if is_vlm:
         assert processor is not None, "processor must be provided when is_vlm is True"
 
@@ -384,6 +390,30 @@ def build_eagle3_dataset(
             conversations = examples.pop("conversations")
             if "id" in examples:
                 examples.pop("id")
+            if "tools" in examples:
+                tools_raw = examples.pop("tools")
+                # Parse tools: handle JSON strings from safe_conversations_generator
+                tools = []
+                for tool_item in tools_raw:
+                    if isinstance(tool_item, (str, list)):
+                        try:
+                            tools.append(json.loads(tool_item))
+                        except json.JSONDecodeError:
+                            warnings.warn(
+                                f"Failed to parse tools JSON string: {tool_item[:100]}..."
+                            )
+                            tools.append([])
+                    elif isinstance(tool_item, list):
+                        tools.append(tool_item)
+                    elif tool_item is None:
+                        tools.append([])
+                    else:
+                        warnings.warn(
+                            f"Unexpected tools type: {type(tool_item)}, using empty list"
+                        )
+                        tools.append([])
+            else:
+                tools = [[] for _ in range(len(conversations))]
             processed = preprocess_conversations(
                 tokenizer,
                 conversations,
@@ -391,6 +421,7 @@ def build_eagle3_dataset(
                 max_length,
                 is_preformatted=False,
                 train_only_last_turn=train_only_last_turn,
+                tools=tools,
                 **examples,
             )
 
@@ -433,6 +464,30 @@ def build_eagle3_dataset(
         load_from_cache_file=load_from_cache_file,
         cache_file_name=cache_file_name,
     )
+
+    if minimum_valid_tokens is not None:
+        before_filter = len(dataset)
+
+        def has_minimum_valid_tokens(example):
+            loss_mask = example["loss_mask"]
+            if isinstance(loss_mask, torch.Tensor):
+                valid_tokens = int(loss_mask.sum().item())
+            else:
+                valid_tokens = sum(
+                    int(token)
+                    for row in loss_mask
+                    for token in (row if isinstance(row, list) else [row])
+                )
+            return valid_tokens >= minimum_valid_tokens
+
+        dataset = dataset.filter(
+            has_minimum_valid_tokens,
+            num_proc=num_proc,
+            desc=f"Filtering samples with >= {minimum_valid_tokens} trainable tokens",
+        )
+        print(
+            f"Filtered dataset by trainable tokens: {before_filter} -> {len(dataset)}"
+        )
 
     dataset.set_format(type="torch")
     return dataset
@@ -575,13 +630,15 @@ class OfflineEagle3Dataset(torch.utils.data.Dataset):
         new_data["attention_mask"] = attention_mask
 
         # Position ids should align with Ulysses all2all-expanded sequence length.
-        # Local seq_len (per sp_rank) = local_len; attention uses (local_len - ttt_length).
+        # Within each ring group there are sp_ulysses_size Ulysses peers; each holds a
+        # distinct usp_chunk_size slice, so position IDs must differ by ulysses_rank offset.
         sp_ulysses_size = max(1, sp_size // sp_ring_size)
         usp_chunk_size = max(local_len - ttt_length, 0)
         ring_chunk = usp_chunk_size * sp_ulysses_size
-        ring_start = ring_rank * ring_chunk
+        ulysses_rank = sp_rank % sp_ulysses_size
+        ring_start = ring_rank * ring_chunk + ulysses_rank * usp_chunk_size
         new_data["position_ids"] = torch.arange(
-            ring_start, ring_start + ring_chunk, dtype=torch.long
+            ring_start, ring_start + usp_chunk_size, dtype=torch.long
         ).unsqueeze(0)
 
         if transform:
